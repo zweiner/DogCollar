@@ -1,0 +1,167 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Dog Route (BLE)</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+  <style>
+    body { margin:0; font-family: system-ui, Arial; }
+    #top { padding: 10px; display:flex; gap:10px; align-items:center; flex-wrap: wrap; }
+    #map { height: calc(100vh - 70px); }
+    button { padding:8px 12px; cursor:pointer; }
+    #status { opacity:0.85; }
+  </style>
+</head>
+<body>
+  <div id="top">
+    <button id="connect">Connect collar (BLE)</button>
+    <button id="download" disabled>Download + Plot</button>
+    <span id="status">Not connected</span>
+  </div>
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <script>
+    // Must match firmware UUIDs:
+    const SERVICE_UUID = '12345678-1234-1234-1234-1234567890ab';
+    const META_UUID    = '12345678-1234-1234-1234-1234567890ac';
+    const CTRL_UUID    = '12345678-1234-1234-1234-1234567890ad';
+    const DATA_UUID    = '12345678-1234-1234-1234-1234567890ae';
+
+    const statusEl = document.getElementById('status');
+    const connectBtn = document.getElementById('connect');
+    const downloadBtn = document.getElementById('download');
+
+    const map = L.map('map').setView([32.95, -117.25], 14);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+
+    let poly = L.polyline([]).addTo(map);
+    let startMarker = null, endMarker = null;
+
+    let device, server, service, metaCh, ctrlCh, dataCh;
+    let fileSize = 0;
+    let received = 0;
+    let chunks = [];
+    let downloading = false;
+
+    function setStatus(msg) { statusEl.textContent = msg; }
+
+    function parseCSV(text) {
+      const lines = text.trim().split(/\r?\n/);
+      const pts = [];
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        if (i === 0 && line.toLowerCase().includes('lat') && line.toLowerCase().includes('lon')) continue;
+
+        const parts = line.split(',');
+        if (parts.length < 2) continue;
+        const lat = Number(parts[0]);
+        const lon = Number(parts[1]);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+        if (Math.abs(lat) < 0.001 && Math.abs(lon) < 0.001) continue;
+        pts.push([lat, lon]);
+      }
+      return pts;
+    }
+
+    function plot(pts) {
+      poly.setLatLngs(pts);
+      if (startMarker) map.removeLayer(startMarker);
+      if (endMarker) map.removeLayer(endMarker);
+      if (pts.length >= 1) startMarker = L.marker(pts[0]).addTo(map).bindPopup("Start");
+      if (pts.length >= 2) endMarker = L.marker(pts[pts.length-1]).addTo(map).bindPopup("End");
+      if (pts.length >= 2) map.fitBounds(poly.getBounds(), { padding: [20, 20] });
+    }
+
+    function concat(chunks) {
+      const total = chunks.reduce((s,c) => s + c.length, 0);
+      const out = new Uint8Array(total);
+      let off = 0;
+      for (const c of chunks) { out.set(c, off); off += c.length; }
+      return out;
+    }
+
+    async function readMeta() {
+      const v = await metaCh.readValue();
+      const dv = new DataView(v.buffer);
+      fileSize = dv.getUint32(0, true);
+      const chunkBytes = dv.getUint16(4, true);
+      return { fileSize, chunkBytes };
+    }
+
+    function onData(ev) {
+      if (!downloading) return;
+      const dv = ev.target.value;
+      const bytes = new Uint8Array(dv.buffer.slice(dv.byteOffset, dv.byteOffset + dv.byteLength));
+      chunks.push(bytes);
+      received += bytes.length;
+
+      if (fileSize > 0) {
+        const pct = Math.min(100, Math.round((received / fileSize) * 100));
+        setStatus(`Downloading… ${received}/${fileSize} bytes (${pct}%)`);
+      } else {
+        setStatus(`Downloading… ${received} bytes`);
+      }
+
+      if (fileSize > 0 && received >= fileSize) finish();
+    }
+
+    function finish() {
+      downloading = false;
+      dataCh.removeEventListener('characteristicvaluechanged', onData);
+      setStatus(`Download complete: ${received} bytes`);
+
+      const all = concat(chunks);
+      const text = new TextDecoder().decode(all);
+
+      const pts = parseCSV(text);
+      if (pts.length < 2) {
+        setStatus(`Got CSV but only ${pts.length} valid points. Check format.`);
+        return;
+      }
+      plot(pts);
+      setStatus(`Plotted ${pts.length} points.`);
+    }
+
+    connectBtn.onclick = async () => {
+      try {
+        setStatus("Requesting device…");
+        device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE_UUID] }] });
+
+        setStatus("Connecting…");
+        server = await device.gatt.connect();
+        service = await server.getPrimaryService(SERVICE_UUID);
+
+        metaCh = await service.getCharacteristic(META_UUID);
+        ctrlCh = await service.getCharacteristic(CTRL_UUID);
+        dataCh = await service.getCharacteristic(DATA_UUID);
+
+        const meta = await readMeta();
+        setStatus(`Connected. route.csv size=${meta.fileSize} bytes`);
+        downloadBtn.disabled = false;
+      } catch (e) {
+        setStatus(`Connect error: ${e.message}`);
+      }
+    };
+
+    downloadBtn.onclick = async () => {
+      try {
+        const meta = await readMeta();
+        chunks = [];
+        received = 0;
+        downloading = true;
+
+        await dataCh.startNotifications();
+        dataCh.addEventListener('characteristicvaluechanged', onData);
+
+        setStatus(`Starting download (${meta.fileSize} bytes)…`);
+        await ctrlCh.writeValue(new TextEncoder().encode("START"));
+      } catch (e) {
+        setStatus(`Download error: ${e.message}`);
+      }
+    };
+  </script>
+</body>
+</html>
