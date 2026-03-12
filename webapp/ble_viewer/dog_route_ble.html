@@ -7,23 +7,49 @@
   <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
   <style>
     body { margin:0; font-family: system-ui, Arial; }
-    #top { padding: 10px; display:flex; gap:10px; align-items:center; flex-wrap: wrap; }
-    #map { height: calc(100vh - 70px); }
+    #top {
+      padding: 10px;
+      display:flex;
+      gap:10px;
+      align-items:center;
+      flex-wrap: wrap;
+    }
+    #map { height: calc(100vh - 130px); }
     button { padding:8px 12px; cursor:pointer; }
-    #status { opacity:0.85; }
+    #status { opacity:0.85; min-width: 220px; }
+    #stats {
+      padding: 0 10px 10px 10px;
+      display: flex;
+      gap: 18px;
+      flex-wrap: wrap;
+      font-size: 15px;
+    }
+    .stat {
+      background: #f4f4f4;
+      padding: 8px 12px;
+      border-radius: 8px;
+    }
   </style>
 </head>
 <body>
   <div id="top">
     <button id="connect">Connect collar (BLE)</button>
+    <button id="endTracking" disabled>End Tracking</button>
     <button id="download" disabled>Download + Plot</button>
     <span id="status">Not connected</span>
   </div>
+
+  <div id="stats">
+    <div class="stat">Points: <strong id="pointsVal">0</strong></div>
+    <div class="stat">Distance: <strong id="distanceVal">0.00 m</strong></div>
+    <div class="stat">Steps: <strong id="stepsVal">0</strong></div>
+  </div>
+
   <div id="map"></div>
 
   <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
   <script>
-    // Must match firmware UUIDs:
+    // Must match firmware UUIDs
     const SERVICE_UUID = '12345678-1234-1234-1234-1234567890ab';
     const META_UUID    = '12345678-1234-1234-1234-1234567890ac';
     const CTRL_UUID    = '12345678-1234-1234-1234-1234567890ad';
@@ -31,13 +57,21 @@
 
     const statusEl = document.getElementById('status');
     const connectBtn = document.getElementById('connect');
+    const endTrackingBtn = document.getElementById('endTracking');
     const downloadBtn = document.getElementById('download');
 
-    const map = L.map('map').setView([32.95, -117.25], 14);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+    const pointsVal = document.getElementById('pointsVal');
+    const distanceVal = document.getElementById('distanceVal');
+    const stepsVal = document.getElementById('stepsVal');
 
-    let poly = L.polyline([]).addTo(map);
-    let startMarker = null, endMarker = null;
+    const map = L.map('map').setView([32.95, -117.25], 14);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19
+    }).addTo(map);
+
+    let poly = L.polyline([], { weight: 4 }).addTo(map);
+    let startMarker = null;
+    let endMarker = null;
 
     let device, server, service, metaCh, ctrlCh, dataCh;
     let fileSize = 0;
@@ -45,41 +79,111 @@
     let chunks = [];
     let downloading = false;
 
-    function setStatus(msg) { statusEl.textContent = msg; }
+    function setStatus(msg) {
+      statusEl.textContent = msg;
+    }
+
+    function haversineMeters(lat1, lon1, lat2, lon2) {
+      const R = 6371000;
+      const toRad = d => d * Math.PI / 180;
+
+      const dLat = toRad(lat2 - lat1);
+      const dLon = toRad(lon2 - lon1);
+
+      const a =
+        Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+        Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+        Math.sin(dLon / 2) * Math.sin(dLon / 2);
+
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      return R * c;
+    }
 
     function parseCSV(text) {
       const lines = text.trim().split(/\r?\n/);
-      const pts = [];
+      const points = [];
+      let maxSteps = 0;
+
+      let prevLat = null;
+      let prevLon = null;
+
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i].trim();
         if (!line) continue;
-        if (i === 0 && line.toLowerCase().includes('lat') && line.toLowerCase().includes('lon')) continue;
+
+        if (i === 0 && line.toLowerCase().includes('lat') && line.toLowerCase().includes('lon')) {
+          continue;
+        }
 
         const parts = line.split(',');
-        if (parts.length < 2) continue;
+        if (parts.length < 10) continue;
+
         const lat = Number(parts[0]);
         const lon = Number(parts[1]);
+        const steps = Number(parts[9]);
+
+        if (Number.isFinite(steps)) {
+          maxSteps = Math.max(maxSteps, steps);
+        }
+
         if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
         if (Math.abs(lat) < 0.001 && Math.abs(lon) < 0.001) continue;
-        pts.push([lat, lon]);
+
+        // remove duplicate consecutive GPS points
+        if (prevLat !== null && prevLon !== null) {
+          const same = Math.abs(lat - prevLat) < 1e-7 && Math.abs(lon - prevLon) < 1e-7;
+          if (same) continue;
+        }
+
+        points.push([lat, lon]);
+        prevLat = lat;
+        prevLon = lon;
       }
-      return pts;
+
+      let totalDistanceM = 0;
+      for (let i = 1; i < points.length; i++) {
+        totalDistanceM += haversineMeters(
+          points[i - 1][0], points[i - 1][1],
+          points[i][0],     points[i][1]
+        );
+      }
+
+      return {
+        points,
+        totalDistanceM,
+        maxSteps
+      };
     }
 
-    function plot(pts) {
-      poly.setLatLngs(pts);
+    function plot(points) {
+      poly.setLatLngs(points);
+
       if (startMarker) map.removeLayer(startMarker);
       if (endMarker) map.removeLayer(endMarker);
-      if (pts.length >= 1) startMarker = L.marker(pts[0]).addTo(map).bindPopup("Start");
-      if (pts.length >= 2) endMarker = L.marker(pts[pts.length-1]).addTo(map).bindPopup("End");
-      if (pts.length >= 2) map.fitBounds(poly.getBounds(), { padding: [20, 20] });
+
+      if (points.length >= 1) {
+        startMarker = L.marker(points[0]).addTo(map).bindPopup("Start");
+      }
+
+      if (points.length >= 2) {
+        endMarker = L.marker(points[points.length - 1]).addTo(map).bindPopup("End");
+      }
+
+      if (points.length >= 2) {
+        map.fitBounds(poly.getBounds(), { padding: [20, 20] });
+      } else if (points.length === 1) {
+        map.setView(points[0], 18);
+      }
     }
 
     function concat(chunks) {
-      const total = chunks.reduce((s,c) => s + c.length, 0);
+      const total = chunks.reduce((s, c) => s + c.length, 0);
       const out = new Uint8Array(total);
       let off = 0;
-      for (const c of chunks) { out.set(c, off); off += c.length; }
+      for (const c of chunks) {
+        out.set(c, off);
+        off += c.length;
+      }
       return out;
     }
 
@@ -93,8 +197,12 @@
 
     function onData(ev) {
       if (!downloading) return;
+
       const dv = ev.target.value;
-      const bytes = new Uint8Array(dv.buffer.slice(dv.byteOffset, dv.byteOffset + dv.byteLength));
+      const bytes = new Uint8Array(
+        dv.buffer.slice(dv.byteOffset, dv.byteOffset + dv.byteLength)
+      );
+
       chunks.push(bytes);
       received += bytes.length;
 
@@ -105,30 +213,44 @@
         setStatus(`Downloading… ${received} bytes`);
       }
 
-      if (fileSize > 0 && received >= fileSize) finish();
+      if (fileSize > 0 && received >= fileSize) {
+        finishDownload();
+      }
     }
 
-    function finish() {
+    function finishDownload() {
       downloading = false;
       dataCh.removeEventListener('characteristicvaluechanged', onData);
-      setStatus(`Download complete: ${received} bytes`);
 
       const all = concat(chunks);
       const text = new TextDecoder().decode(all);
 
-      const pts = parseCSV(text);
-      if (pts.length < 2) {
-        setStatus(`Got CSV but only ${pts.length} valid points. Check format.`);
+      const result = parseCSV(text);
+
+      pointsVal.textContent = result.points.length;
+      distanceVal.textContent =
+        result.totalDistanceM >= 1000
+          ? `${(result.totalDistanceM / 1000).toFixed(2)} km`
+          : `${result.totalDistanceM.toFixed(2)} m`;
+      stepsVal.textContent = result.maxSteps;
+
+      if (result.points.length < 2) {
+        setStatus(`Download complete, but only ${result.points.length} valid GPS point(s) found.`);
+        if (result.points.length === 1) plot(result.points);
         return;
       }
-      plot(pts);
-      setStatus(`Plotted ${pts.length} points.`);
+
+      plot(result.points);
+      setStatus(`Plotted ${result.points.length} route points. Distance and steps updated.`);
     }
 
     connectBtn.onclick = async () => {
       try {
         setStatus("Requesting device…");
-        device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE_UUID] }] });
+
+        device = await navigator.bluetooth.requestDevice({
+          filters: [{ services: [SERVICE_UUID] }]
+        });
 
         setStatus("Connecting…");
         server = await device.gatt.connect();
@@ -139,10 +261,21 @@
         dataCh = await service.getCharacteristic(DATA_UUID);
 
         const meta = await readMeta();
-        setStatus(`Connected. route.csv size=${meta.fileSize} bytes`);
+        setStatus(`Connected. Current file size: ${meta.fileSize} bytes`);
+
+        endTrackingBtn.disabled = false;
         downloadBtn.disabled = false;
       } catch (e) {
         setStatus(`Connect error: ${e.message}`);
+      }
+    };
+
+    endTrackingBtn.onclick = async () => {
+      try {
+        await ctrlCh.writeValue(new TextEncoder().encode("STOP_TRACK"));
+        setStatus("Tracking stopped. Ready to download route.");
+      } catch (e) {
+        setStatus(`End tracking error: ${e.message}`);
       }
     };
 
