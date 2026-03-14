@@ -72,57 +72,81 @@ static uint32_t lastCsvLogMs = 0;
 static uint32_t lastGpsAcceptMs = 0;
 static uint32_t lastMetaUpdateMs = 0;
 
-static const uint32_t ACCEL_SAMPLE_PERIOD_MS = 20;     // 50 Hz internal sampling
-static const uint32_t CSV_LOG_PERIOD_MS      = 100;    // 10 Hz CSV append
+static const uint32_t ACCEL_SAMPLE_PERIOD_MS = 20;     // 50 Hz
+static const uint32_t CSV_LOG_PERIOD_MS      = 100;    // 10 Hz
 static const uint32_t GPS_REFRESH_MS         = 10000;  // accept GPS at least every 10 sec
 static const uint32_t META_UPDATE_MS         = 1000;   // update BLE metadata once/sec
 static const uint32_t DEBUG_PERIOD_MS        = 2000;   // serial debug every 2 sec
 
 // ===================== GPS SENSITIVITY =====================
-static const double GPS_MOVE_THRESHOLD_M = 3.0; // sensitive to small movement
+static const double GPS_MOVE_THRESHOLD_M = 3.0;
 
 static double acceptedLat = 0.0;
 static double acceptedLon = 0.0;
 static bool haveAcceptedGps = false;
 
 static double lastMoveDistM = 0.0;
+static bool gpsAcceptedThisCycle = false;
 
-// ===================== ACCEL / STEP DETECTION =====================
+// ===================== PEDOMETER =====================
 struct AccelSample {
   int xRaw;
   int yRaw;
   int zRaw;
-  float mag;
+  float xCentered;
+  float yCentered;
+  float zCentered;
+  float l1;
   float baseline;
-  float dyn;
+  float detrended;
+  float filtered;
 };
 
-static AccelSample latestAccel = {0, 0, 0, 0, 0, 0};
+static AccelSample latestAccel = {0};
 
-static float magBaseline = 0.0f;
-static bool baselineInitialized = false;
+// Bias calibration
+static bool accelBiasReady = false;
+static uint32_t accelBiasCount = 0;
+static float xBiasAccum = 0.0f;
+static float yBiasAccum = 0.0f;
+static float zBiasAccum = 0.0f;
+static float xBias = 0.0f;
+static float yBias = 0.0f;
+static float zBias = 0.0f;
 
-// Calmer locomotion behavior
+// Detrend / smoothing
+static bool l1BaselineInitialized = false;
+static float l1Baseline = 0.0f;
+
+static const int FILTER_N = 5;
+static float filtBuf[FILTER_N] = {0};
+static int filtIdx = 0;
+static float filtSum = 0.0f;
+
+// Peak detector history
+static float prev2 = 0.0f;
+static float prev1 = 0.0f;
+
+// Pedometer / locomotion state
 static bool locomotionActive = false;
 static uint32_t lastMotionMs = 0;
 static uint32_t locomotionStartMs = 0;
 
-static const float MOTION_START_THRESHOLD = 160.0f;
-static const float MOTION_STOP_THRESHOLD  = 95.0f;
-static const uint32_t MOTION_HOLD_MS      = 1600;
-
-// Calmer step detection
-static float prevDyn2 = 0.0f;
-static float prevDyn1 = 0.0f;
+static bool stepDetectorArmed = false;
+static uint32_t stepWarmupUntilMs = 0;
 static uint32_t lastStepMs = 0;
 static uint32_t stepCount = 0;
 
-static const float STEP_PEAK_THRESHOLD        = 70.0f;
-static const uint32_t STEP_MIN_INTERVAL_MS    = 320;
-static const uint32_t STEP_MAX_INTERVAL_MS    = 1500;
-static const uint32_t STEP_ENABLE_AFTER_LOCO_MS = 500;
-// ===================== CSV CACHE =====================
-static bool gpsAcceptedThisCycle = false;
+// L1 pedometer thresholds
+static const float THRESH_LOW = 22.0f;
+static const float THRESH_HIGH = 220.0f;
+static const uint32_t PEAK_MIN_DIST_MS = 240;
+
+// Keep locomotion behavior from the working pedometer logic
+static const float LOCO_START_THRESH = 18.0f;
+static const float LOCO_STOP_THRESH  = 10.0f;
+static const uint32_t LOCO_HOLD_MS   = 800;
+static const uint32_t STEP_WARMUP_MS = 1500;
 
 // ===================== BLE META PACKET =====================
 #pragma pack(push, 1)
@@ -202,9 +226,13 @@ void updateDisplay() {
 
   snprintf(row2, sizeof(row2), "STEPS:%lu", (unsigned long)stepCount);
 
-  snprintf(row3, sizeof(row3), "TRK:%s LOC:%s",
-           trackingEnabled ? "ON" : "OFF",
-           locomotionActive ? "Y" : "N");
+  if (!accelBiasReady) {
+    snprintf(row3, sizeof(row3), "CALIBRATING...");
+  } else {
+    snprintf(row3, sizeof(row3), "TRK:%s LOC:%s",
+             trackingEnabled ? "ON" : "OFF",
+             locomotionActive ? "Y" : "N");
+  }
 
   writeDisplay(row0, 0, true);
   writeDisplay(row1, 1, false);
@@ -213,10 +241,26 @@ void updateDisplay() {
 }
 
 // ---------- Mode control ----------
+void resetPedometerState() {
+  l1BaselineInitialized = false;
+  l1Baseline = 0.0f;
+  filtIdx = 0;
+  filtSum = 0.0f;
+  for (int i = 0; i < FILTER_N; i++) filtBuf[i] = 0.0f;
+  prev2 = 0.0f;
+  prev1 = 0.0f;
+  locomotionActive = false;
+  stepDetectorArmed = false;
+  lastMotionMs = 0;
+  locomotionStartMs = 0;
+  lastStepMs = 0;
+}
+
 void enterIdleMode() {
   systemMode = MODE_IDLE;
   trackingEnabled = false;
   locomotionActive = false;
+  stepDetectorArmed = false;
 
   Serial.println("Entering IDLE mode");
   showIdleScreen();
@@ -225,6 +269,8 @@ void enterIdleMode() {
 void enterActiveMode() {
   systemMode = MODE_ACTIVE;
   trackingEnabled = true;
+  resetPedometerState();
+  stepWarmupUntilMs = millis() + STEP_WARMUP_MS;
 
   Serial.println("Entering ACTIVE mode");
   showWakeScreen();
@@ -263,7 +309,7 @@ bool createNewRouteFile() {
   File f = SD.open(currentRoutePath.c_str(), FILE_WRITE);
   if (!f) return false;
 
-  f.println("lat,lon,t_ms,ax,ay,az,mag,dyn,locomotion,steps,gps_fresh,gps_move_m");
+  f.println("lat,lon,t_ms,ax,ay,az,l1,filtered,locomotion,steps,gps_fresh,gps_move_m");
   f.close();
 
   Serial.print("Created new route file: ");
@@ -273,7 +319,7 @@ bool createNewRouteFile() {
 
 void appendSessionRow(double lat, double lon, uint32_t t_ms,
                       int ax, int ay, int az,
-                      float mag, float dyn,
+                      float l1, float filtered,
                       bool locomotion, uint32_t steps,
                       bool gpsFresh, double gpsMoveM) {
   if (currentRoutePath.length() == 0) return;
@@ -284,28 +330,17 @@ void appendSessionRow(double lat, double lon, uint32_t t_ms,
     return;
   }
 
-  f.print(lat, 6);
-  f.print(",");
-  f.print(lon, 6);
-  f.print(",");
-  f.print(t_ms);
-  f.print(",");
-  f.print(ax);
-  f.print(",");
-  f.print(ay);
-  f.print(",");
-  f.print(az);
-  f.print(",");
-  f.print(mag, 2);
-  f.print(",");
-  f.print(dyn, 2);
-  f.print(",");
-  f.print(locomotion ? 1 : 0);
-  f.print(",");
-  f.print(steps);
-  f.print(",");
-  f.print(gpsFresh ? 1 : 0);
-  f.print(",");
+  f.print(lat, 6);           f.print(",");
+  f.print(lon, 6);           f.print(",");
+  f.print(t_ms);             f.print(",");
+  f.print(ax);               f.print(",");
+  f.print(ay);               f.print(",");
+  f.print(az);               f.print(",");
+  f.print(l1, 2);            f.print(",");
+  f.print(filtered, 2);      f.print(",");
+  f.print(locomotion ? 1 : 0); f.print(",");
+  f.print(steps);            f.print(",");
+  f.print(gpsFresh ? 1 : 0); f.print(",");
   f.println(gpsMoveM, 2);
 
   f.close();
@@ -364,7 +399,7 @@ void flushFinalSessionRow() {
   appendSessionRow(
     lat, lon, now,
     latestAccel.xRaw, latestAccel.yRaw, latestAccel.zRaw,
-    latestAccel.mag, latestAccel.dyn,
+    latestAccel.l1, latestAccel.filtered,
     locomotionActive, stepCount,
     gpsAcceptedThisCycle, lastMoveDistM
   );
@@ -430,6 +465,7 @@ class CtrlCallbacks : public NimBLECharacteristicCallbacks {
       flushFinalSessionRow();
       trackingEnabled = false;
       locomotionActive = false;
+      stepDetectorArmed = false;
       systemMode = MODE_IDLE;
       showIdleScreen();
     }
@@ -474,13 +510,47 @@ void setupBLE() {
   Serial.println("BLE advertising started (DogCollar).");
 }
 
-// ---------- Accelerometer ----------
+// ---------- Accelerometer / pedometer ----------
 void setupAccelerometer() {
   analogReadResolution(12);
   analogSetPinAttenuation(ACCEL_X_PIN, ADC_11db);
   analogSetPinAttenuation(ACCEL_Y_PIN, ADC_11db);
   analogSetPinAttenuation(ACCEL_Z_PIN, ADC_11db);
   Serial.println("Accelerometer init complete");
+}
+
+void calibrateAccelBiasStep() {
+  int xr = analogRead(ACCEL_X_PIN);
+  int yr = analogRead(ACCEL_Y_PIN);
+  int zr = analogRead(ACCEL_Z_PIN);
+
+  xBiasAccum += xr;
+  yBiasAccum += yr;
+  zBiasAccum += zr;
+  accelBiasCount++;
+
+  if (accelBiasCount >= 100) {  // ~2 s at 50 Hz
+    xBias = xBiasAccum / accelBiasCount;
+    yBias = yBiasAccum / accelBiasCount;
+    zBias = zBiasAccum / accelBiasCount;
+    accelBiasReady = true;
+
+    Serial.println("Accel bias calibration done.");
+    Serial.print("xBias = "); Serial.println(xBias);
+    Serial.print("yBias = "); Serial.println(yBias);
+    Serial.print("zBias = "); Serial.println(zBias);
+
+    resetPedometerState();
+    stepWarmupUntilMs = millis() + STEP_WARMUP_MS;
+  }
+}
+
+float movingAverage(float x) {
+  filtSum -= filtBuf[filtIdx];
+  filtBuf[filtIdx] = x;
+  filtSum += x;
+  filtIdx = (filtIdx + 1) % FILTER_N;
+  return filtSum / FILTER_N;
 }
 
 AccelSample readAccelerometer() {
@@ -490,70 +560,90 @@ AccelSample readAccelerometer() {
   s.yRaw = analogRead(ACCEL_Y_PIN);
   s.zRaw = analogRead(ACCEL_Z_PIN);
 
-  float x = (float)s.xRaw;
-  float y = (float)s.yRaw;
-  float z = (float)s.zRaw;
+  s.xCentered = s.xRaw - xBias;
+  s.yCentered = s.yRaw - yBias;
+  s.zCentered = s.zRaw - zBias;
 
-  s.mag = sqrtf(x * x + y * y + z * z);
+  s.l1 = fabsf(s.xCentered) + fabsf(s.yCentered) + fabsf(s.zCentered);
 
-  if (!baselineInitialized) {
-    magBaseline = s.mag;
-    baselineInitialized = true;
+  if (!l1BaselineInitialized) {
+    l1Baseline = s.l1;
+    l1BaselineInitialized = true;
   }
 
- magBaseline = 0.992f * magBaseline + 0.008f * s.mag;
-
-  s.baseline = magBaseline;
-  s.dyn = fabsf(s.mag - s.baseline);
+  l1Baseline = 0.98f * l1Baseline + 0.02f * s.l1;
+  s.baseline = l1Baseline;
+  s.detrended = s.l1 - s.baseline;
+  s.filtered = movingAverage(s.detrended);
 
   return s;
 }
 
 void updateLocomotionAndSteps(const AccelSample& s, uint32_t now) {
-  if (s.dyn > MOTION_START_THRESHOLD) {
-    if (!locomotionActive) {
-      locomotionStartMs = now;
-    }
-    locomotionActive = true;
-    lastMotionMs = now;
-  } else if (locomotionActive && s.dyn > MOTION_STOP_THRESHOLD) {
-    lastMotionMs = now;
-  } else if (locomotionActive && (now - lastMotionMs > MOTION_HOLD_MS)) {
+  if (!trackingEnabled) {
     locomotionActive = false;
+    stepDetectorArmed = false;
+    prev2 = s.filtered;
+    prev1 = s.filtered;
+    return;
   }
 
-  bool isPeak = (prevDyn1 > prevDyn2) &&
-                (prevDyn1 > s.dyn) &&
-                ((prevDyn1 - prevDyn2) > 8.0f) &&
-                ((prevDyn1 - s.dyn) > 8.0f);
+  // Locomotion gate from the working pedometer
+  if (s.filtered > LOCO_START_THRESH) {
+    if (!locomotionActive) {
+      locomotionActive = true;
+      locomotionStartMs = now;
+      lastMotionMs = now;
 
-  bool locomotionSettled =
-      locomotionActive &&
-      ((now - locomotionStartMs) >= STEP_ENABLE_AFTER_LOCO_MS);
+      prev2 = s.filtered;
+      prev1 = s.filtered;
+      stepDetectorArmed = false;
+      stepWarmupUntilMs = now + STEP_WARMUP_MS;
 
-  if (locomotionSettled && isPeak && prevDyn1 > STEP_PEAK_THRESHOLD) {
+      Serial.println("Locomotion START");
+    } else {
+      lastMotionMs = now;
+    }
+  } else if (locomotionActive && s.filtered > LOCO_STOP_THRESH) {
+    lastMotionMs = now;
+  } else if (locomotionActive && (now - lastMotionMs > LOCO_HOLD_MS)) {
+    locomotionActive = false;
+    stepDetectorArmed = false;
+    Serial.println("Locomotion STOP");
+  }
+
+  if (locomotionActive && !stepDetectorArmed && now >= stepWarmupUntilMs) {
+    stepDetectorArmed = true;
+    prev2 = s.filtered;
+    prev1 = s.filtered;
+    Serial.println("Step detector ARMED");
+  }
+
+  bool isPeak =
+      (prev1 > prev2) &&
+      (prev1 >= s.filtered) &&
+      (prev1 >= THRESH_LOW) &&
+      (prev1 <= THRESH_HIGH);
+
+  if (locomotionActive && stepDetectorArmed && isPeak) {
     uint32_t dt = now - lastStepMs;
-
-    if (dt >= STEP_MIN_INTERVAL_MS &&
-        (lastStepMs == 0 || dt <= STEP_MAX_INTERVAL_MS)) {
+    if (dt >= PEAK_MIN_DIST_MS) {
       stepCount++;
       lastStepMs = now;
 
       Serial.println("******** STEP DETECTED ********");
       Serial.print("count = ");
       Serial.println(stepCount);
-      Serial.print("peak dyn = ");
-      Serial.println(prevDyn1, 2);
+      Serial.print("peak = ");
+      Serial.println(prev1, 2);
       Serial.print("dt ms = ");
       Serial.println(dt);
-      Serial.print("locomotion settled = ");
-      Serial.println(locomotionSettled ? "YES" : "NO");
       Serial.println("******************************");
     }
   }
 
-  prevDyn2 = prevDyn1;
-  prevDyn1 = s.dyn;
+  prev2 = prev1;
+  prev1 = s.filtered;
 }
 
 void handleAccelerometer() {
@@ -562,6 +652,11 @@ void handleAccelerometer() {
   uint32_t now = millis();
   if (now - lastAccelSampleMs < ACCEL_SAMPLE_PERIOD_MS) return;
   lastAccelSampleMs = now;
+
+  if (!accelBiasReady) {
+    calibrateAccelBiasStep();
+    return;
+  }
 
   latestAccel = readAccelerometer();
   updateLocomotionAndSteps(latestAccel, now);
@@ -708,6 +803,9 @@ void printDebugStatus() {
   Serial.print("Tracking enabled: ");
   Serial.println(trackingEnabled ? "YES" : "NO");
 
+  Serial.print("Accel bias ready: ");
+  Serial.println(accelBiasReady ? "YES" : "NO");
+
   Serial.print("ACC X:");
   Serial.print(latestAccel.xRaw);
   Serial.print(" Y:");
@@ -715,15 +813,17 @@ void printDebugStatus() {
   Serial.print(" Z:");
   Serial.println(latestAccel.zRaw);
 
-  Serial.print("MAG: ");
-  Serial.print(latestAccel.mag, 1);
-  Serial.print("  BASE: ");
-  Serial.print(latestAccel.baseline, 1);
-  Serial.print("  DYN: ");
-  Serial.println(latestAccel.dyn, 1);
+  Serial.print("L1: ");
+  Serial.println(latestAccel.l1, 2);
+
+  Serial.print("Filtered: ");
+  Serial.println(latestAccel.filtered, 2);
 
   Serial.print("Locomotion active: ");
   Serial.println(locomotionActive ? "YES" : "NO");
+
+  Serial.print("Step detector armed: ");
+  Serial.println(stepDetectorArmed ? "YES" : "NO");
 
   Serial.print("Step count: ");
   Serial.println(stepCount);
@@ -742,6 +842,7 @@ void handleCsvLogging() {
   if (!sdOk) return;
   if (!trackingEnabled) return;
   if (currentRoutePath.length() == 0) return;
+  if (!accelBiasReady) return;
 
   uint32_t now = millis();
   if (now - lastCsvLogMs < CSV_LOG_PERIOD_MS) return;
@@ -761,7 +862,7 @@ void handleCsvLogging() {
   appendSessionRow(
     lat, lon, now,
     latestAccel.xRaw, latestAccel.yRaw, latestAccel.zRaw,
-    latestAccel.mag, latestAccel.dyn,
+    latestAccel.l1, latestAccel.filtered,
     locomotionActive, stepCount,
     gpsAcceptedThisCycle, lastMoveDistM
   );
@@ -779,7 +880,7 @@ void handleMetaUpdate() {
 void setup() {
   Serial.begin(115200);
   delay(400);
-  Serial.println("\n=== Route Sync Firmware (Thing Plus: GPS + ADXL335 + SD + BLE + OLED + Soft Idle) ===");
+  Serial.println("\n=== Route Sync Firmware (GPS + SD + BLE + OLED + L1 Pedometer) ===");
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
@@ -824,6 +925,7 @@ void setup() {
 
   Serial.println("Tracking starts automatically on power-up.");
   Serial.println("Button toggles ACTIVE <-> IDLE.");
+  Serial.println("Keep device still ~2 seconds after boot for accel bias calibration.");
 }
 
 void loop() {
